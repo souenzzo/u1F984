@@ -1,12 +1,22 @@
 (ns u1F984.telegram
-  (:require [clojure.string :as string]
-            [clj-http.client :as client]
+  (:require [clj-http.client :as client]
             [clojure.data.json :as data.json]
             [clojure.spec.alpha :as s]))
 
-(defn json?
-  [s]
-  (string/starts-with? s "application/json"))
+(defn request
+  [req]
+  (-> (client/request req)
+      :body
+      (data.json/read-str :key-fn keyword)
+      :result))
+
+(defn telegram->http
+  [token {:keys [method] :as params}]
+  {:method  :post
+   :url     (format "https://api.telegram.org/bot%s/%s" token (name method))
+   :headers {"Content-Type" "application/json"}
+   :body    (data.json/write-str params)})
+
 (defmulti api :method)
 (defmethod api :getMe
   [_]
@@ -51,22 +61,6 @@
 
 (s/def ::event (s/multi-spec api :method))
 
-(defn telegram->http
-  [base-url {:keys [method] :as params}]
-  {:method  :post
-   :url     (format "%s/%s" base-url (name method))
-   :headers {"Content-Type" "application/json"}
-   :body    (data.json/write-str params)})
-
 (s/fdef telegram->http
         :args (s/cat :url string?
                      :args ::event))
-
-
-(defn request
-  [req]
-  (let [{{:strs [Content-Type]} :headers
-         :keys                  [body]} (client/request req)]
-    (cond-> body
-            (json? Content-Type) (data.json/read-str :key-fn keyword))))
-

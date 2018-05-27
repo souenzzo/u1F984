@@ -1,22 +1,30 @@
 (ns u1F984.core-test
   (:require [clojure.test :refer [deftest]]
             [midje.sweet :refer :all]
-            [u1F984.utils :as utils]
-            [u1F984.core :as core]))
+            [u1F984.core :as core]
+            [clojure.string :as string]
+            [io.pedestal.interceptor.chain :as chain]))
 
 
 (deftest my-first-test
-  (let [ctx {}]
+  (let [ctx (core/make-ctx)]
     (fact
-      (->> {:event/type :event.type/update
-            :update_id  123
-            :message    {:message_id 1,
-                         :from       {:id 321}
-                         :chat       {:id 321}
-                         :date       #inst"2018"
-                         :text       "lambda"}}
-           (utils/dispatch-event ctx)
+      (->> (chain/execute (assoc ctx
+                            :event {:event/type :event.type/update
+                                    :message    {:chat {:id 222}
+                                                 :text "alpha"}}))
            :api.telegram/dispatch)
-      => (just #{(contains {:method  :sendMessage
-                            :chat_id 116632598
-                            :text    "λ"})}))))
+      => [{:method  :sendMessage
+           :chat_id 222
+           :text    (string/join "\n" ["latin small letter alpha: ɑ"
+                                       "latin small letter turned alpha: ɒ"
+                                       "greek capital letter alpha with tonos: Ά"])}])
+    (fact
+      (->> (chain/execute (assoc ctx
+                            :event {:event/type :event.type/update
+                                    :message    {:chat {:id 222}
+                                                 :text "zzzzz"}}))
+           :api.telegram/dispatch)
+      => [{:method  :sendMessage
+           :chat_id 222
+           :text    "404"}])))
