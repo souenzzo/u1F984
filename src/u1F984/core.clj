@@ -45,7 +45,10 @@
        (take-while coll?)
        (keep (fn [[k v]]
                (when (string? v)
-                 [k (normalize v)])))
+                 (let [nv (normalize v)]
+                   (when-not (or (string/blank? nv)
+                                 (string/blank? (str k)))
+                     [k nv])))))
        (into (sorted-map))))
 
 (defn match
@@ -64,14 +67,13 @@
                                 (match index)
                                 (take limit)
                                 (map (fn [[k v]]
-                                       (format "%s: %s" v k)))
+                                       (format "%s: %s (%s)" v k (int k))))
                                 (string/join "\n"))]
               (assoc ctx
-                :api.telegram/dispatch [{:method  :sendMessage
-                                         :chat_id id
-                                         :text    (if (string/blank? response)
-                                                    "404"
-                                                    response)}])))})
+                :api.telegram/dispatch `[(telegram/send-message ~{::telegram/chat_id id
+                                                                  ::telegram/text    (if (string/blank? response)
+                                                                                       "404"
+                                                                                       response)})])))})
 
 (def routes
   {:event.type/update [handler]})
@@ -103,7 +105,7 @@
                            (Thread/sleep timeout)
                            (doseq [msg-update (->> {:method :getUpdates}
                                                    (telegram/telegram->http token)
-                                                   telegram/request)]
+                                                   telegram/request!)]
                              (async/>!! chan msg-update))
                            (recur))))))
 
@@ -116,10 +118,7 @@
                             :event/type :event.type/update))
           {:keys [api.telegram/dispatch]} (chain/execute ctx*)]
       (prn [:msg msg-update dispatch])
-      (doseq [msg dispatch]
-        (try
-          (->> msg (telegram/telegram->http token) telegram/request)
-          (catch Throwable e (println e))))
+      (telegram/parser {::telegram/token token} dispatch)
       (recur))))
 
 (defonce updates
