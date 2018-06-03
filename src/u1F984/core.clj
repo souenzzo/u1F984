@@ -3,28 +3,34 @@
   (:require [u1F984.telegram :as telegram]
             [io.pedestal.interceptor.chain :as chain]
             [clojure.string :as string]
+            [clojure.java.jdbc :as j]
             [clojure.core.async :as async])
   (:import (java.text Normalizer$Form Normalizer)))
 
-(defn distinct-by
-  [f]
-  (fn [rf]
-    (let [seen (volatile! #{})]
-      (fn
-        ([] (rf))
-        ([result] (rf result))
-        ([result input]
-         (let [x (f input)]
-           (if (contains? @seen x)
-             result
-             (do (vswap! seen conj x)
-                 (rf result input)))))))))
-
-
-
 (def token (System/getenv "bot_token"))
 
-(def ^:dynamic limit 3)
+(def ^:dynamic limit
+  3)
+
+(def update-timeout
+  1000)
+
+
+(defn distinct-by
+  ([f] (distinct-by f #{}))
+  ([f seen]
+   (fn [rf]
+     (let [seen (volatile! seen)]
+       (fn
+         ([] (rf))
+         ([result] (rf result))
+         ([result input]
+          (let [x (f input)]
+            (if (contains? @seen x)
+              result
+              (do (vswap! seen conj x)
+                  (rf result input))))))))))
+
 
 (defn normalize
   [s]
@@ -59,10 +65,11 @@
 
 (def handler
   {:name  ::handler
-   :enter (fn [{{{{:keys [id]} :chat
-                  :keys        [text]} :message} :event
-                ::keys                           [index]
-                :as                              ctx}]
+   :enter (fn [{{{{chat-id :telegram.chat/id} :telegram.message/chat
+                  :telegram.message/keys      [text id]} :telegram.update/message
+                 :as                                     event} :event
+                ::keys                                          [index]
+                :as                                             ctx}]
             (let [response (->> (normalize text)
                                 (match index)
                                 (take limit)
@@ -70,10 +77,12 @@
                                        (format "%s: %s (%s)" v k (int k))))
                                 (string/join "\n"))]
               (assoc ctx
-                :api.telegram/dispatch `[(telegram/send-message ~{::telegram/chat_id id
-                                                                  ::telegram/text    (if (string/blank? response)
-                                                                                       "404"
-                                                                                       response)})])))})
+                :api.telegram/dispatch `[{(telegram/received ~{::telegram/message_id id})
+                                          [{(telegram/send-message ~{::telegram/chat_id chat-id
+                                                                     ::telegram/text    (if (string/blank? response)
+                                                                                          "404"
+                                                                                          response)})
+                                            [(telegram/sent ~{::telegram/message_id id})]}]}])))})
 
 (def routes
   {:event.type/update [handler]})
@@ -90,41 +99,52 @@
 (defn make-ctx
   []
   (let [interceptors [router]
-        index (make-index)]
-    (chain/enqueue {::index  index
-                    ::routes routes} interceptors)))
-
-(def watch-state (atom nil))
+        index (make-index)
+        conn (telegram/mem-db)]
+    (chain/enqueue {::telegram/conn  conn
+                    ::telegram/db    (telegram/conn->db conn)
+                    ::telegram/token token
+                    ::index          index
+                    ::update-timeout update-timeout
+                    ::routes         routes} interceptors)))
 
 (defn start-watch!
-  [state chan timeout]
+  [state chan {::keys [update-timeout]
+               :as    ctx}]
   (swap! state (fn [fut]
-                 (when fut
+                 (when (future? fut)
                    (future-cancel fut))
                  (future (loop []
-                           (Thread/sleep timeout)
-                           (doseq [msg-update (->> {:method :getUpdates}
-                                                   (telegram/telegram->http token)
-                                                   telegram/request!)]
-                             (async/>!! chan msg-update))
+                           (Thread/sleep update-timeout)
+                           (doseq [update (::telegram/updates (telegram/parser ctx [::telegram/updates]))]
+                             (async/>!! chan update))
                            (recur))))))
 
 (defn start-process!
   [ctx chan]
   (async/go-loop []
-    (let [msg-update (async/<! chan)
-          ctx* (assoc ctx :event
-                          (assoc msg-update
-                            :event/type :event.type/update))
-          {:keys [api.telegram/dispatch]} (chain/execute ctx*)]
-      (prn [:msg msg-update dispatch])
-      (telegram/parser {::telegram/token token} dispatch)
-      (recur))))
+    (when-let [msg-update (async/<! chan)]
+      (let [ctx* (assoc ctx :event
+                            (assoc msg-update
+                              :event/type :event.type/update))
+            {:keys [api.telegram/dispatch]} (chain/execute ctx*)]
+        (telegram/parser ctx dispatch)
+        (recur)))))
 
-(defonce updates
-         (async/chan 100 (distinct-by :update_id)))
-
+(defonce update-chan (atom nil))
+(defonce watch-state (atom nil))
+(def buffer-len 100)
 (defn -main
   [& args]
-  (start-process! (make-ctx) updates)
-  (start-watch! watch-state updates 1000))
+  (let [ctx (make-ctx)
+        {::telegram/keys [msg-ids]} (telegram/parser ctx [::telegram/msg-ids])
+        updates (->> (distinct-by :telegram.update/id msg-ids)
+                     (async/chan (async/sliding-buffer buffer-len))
+                     (reset! update-chan))]
+    (start-process! ctx updates)
+    (start-watch! watch-state updates ctx)))
+
+(defn stop!!
+  []
+  (async/close! @update-chan)
+  (future-cancel @watch-state))

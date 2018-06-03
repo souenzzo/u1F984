@@ -3,8 +3,43 @@
             [clojure.data.json :as data.json]
             [com.wsscode.pathom.core :as p]
             [com.wsscode.pathom.connect :as pc]
-            [clojure.spec.alpha :as s])
-  (:import (java.util Date)))
+            [clojure.spec.alpha :as s]
+            [clojure.java.jdbc :as j])
+  (:import (java.util Date)
+           (clojure.lang Atom PersistentArrayMap)))
+
+
+
+(defprotocol IDb
+  (msg-received? [this message-id])
+  (received-msgs [this]))
+
+(defn mem-db
+  []
+  (atom {:received #{}
+         :sent     #{}}))
+
+(defprotocol IConn
+  (msg-received! [this message-id])
+  (msg-sent! [this message-id])
+  (conn->db [this]))
+
+(extend-type PersistentArrayMap
+  IDb
+  (msg-received? [this message-id]
+    (contains? (received-msgs this) message-id))
+  (received-msgs [this]
+    (:received this)))
+
+(extend-type Atom
+  IConn
+  (conn->db [this] @this)
+  (msg-received! [this message-id]
+    (swap! this (fn [db] (if (msg-received? db message-id)
+                           (throw (ex-info "Duped" {}))
+                           (update db :received conj message-id)))))
+  (msg-sent! [this message-id]
+    (swap! this update :sent conj message-id)))
 
 (defn request!
   [req]
@@ -67,10 +102,13 @@
 (s/def ::event (s/multi-spec api :method))
 
 (def types
-  {::message    {:message_id :telegram.message/id
+  {::update     {:update_id :telegram.update/id
+                 :message   [:telegram.update/message ::message]}
+   ::message    {:message_id :telegram.message/id
                  :from       [:telegram.message/from ::user]
                  :chat       [:telegram.message/chat ::chat]
-                 :date       [:telegram.message/date ::date]}
+                 :date       [:telegram.message/date ::date]
+                 :text       :telegram.message/text}
    ::chat       {:id                             :telegram.chat/id
                  :type                           [:telegram.chat/type ::enum]
                  :title                          :telegram.chat/title
@@ -115,8 +153,12 @@
 (def indexes (atom {}))
 
 (defmulti mutation-fn pc/mutation-dispatch)
+(defmulti resolver-fn pc/resolver-dispatch)
 (def defmutation
   (pc/mutation-factory mutation-fn indexes))
+(def defresolver
+  (pc/resolver-factory resolver-fn indexes))
+
 
 (defmutation `send-message
              {::pc/args   [::chat_id ::text]
@@ -137,9 +179,51 @@
                     (->type ::message))))
 
 
-(def parser (p/parser {::p/env {::p/reader           [p/map-reader pc/all-readers]
-                                ::pc/mutate-dispatch mutation-fn
-                                ::pc/indexes         @indexes}
+
+(defmutation `received
+             {::pc/args [::message_id]}
+             (fn [{::keys [conn]} {::keys [message_id]}]
+               (msg-received! conn message_id)))
+
+(defmutation `sent
+             {::pc/args [::message_id]}
+             (fn [{::keys [conn]} {::keys [message_id]}]
+               (msg-sent! conn message_id)))
+
+
+(defresolver `received-msgs
+             {::pc/args   []
+              ::pc/output [::msg-ids]}
+             (fn [{::keys [db]} _]
+               {::msg-ids (received-msgs db)}))
+
+(defresolver `get-updates
+             {::pc/args   []
+              ::pc/output [{::updates [:telegram.update/id
+                                       #:telegram.update{:message [#:telegram.message{:chat [:telegram.chat/first-name
+                                                                                             :telegram.chat/id
+                                                                                             :telegram.chat/type
+                                                                                             :telegram.user/username]}
+                                                                   :telegram.message/date
+                                                                   #:telegram.message{:from [:telegram.user/bot?
+                                                                                             :telegram.user/first-name
+                                                                                             :telegram.user/id
+                                                                                             :telegram.user/language-code
+                                                                                             :telegram.user/username]}
+                                                                   :telegram.message/id
+                                                                   :telegram.message/text]}]}]}
+             (fn [{::keys [token]} _]
+               (->> (telegram->http token "getUpdates" {})
+                    request!
+                    (->type ::update)
+                    (hash-map ::updates))))
+
+
+
+(def parser (p/parser {::p/env {::p/reader             [p/map-reader pc/all-readers]
+                                ::pc/mutate-dispatch   mutation-fn
+                                ::pc/resolver-dispatch resolver-fn
+                                ::pc/indexes           @indexes}
                        :mutate pc/mutate}))
 
 
